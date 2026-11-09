@@ -1,0 +1,803 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { useParams, useSearchParams, useNavigate, useLocation, Link } from 'react-router-dom';
+import {
+  Calendar,
+  Clock,
+  MapPin,
+  Film,
+  ArrowLeft,
+  ArrowRight,
+  Armchair,
+  ShoppingBag,
+  AlertCircle,
+  Home,
+  XCircle,
+} from 'lucide-react';
+import { Showtime, Seat, SelectedCombo, Booking } from '../types';
+import { movies, showtimes } from '../data/mockData';
+import { getMovieByIdFromFirestore } from '../firebase/movieService';
+import { findShowtimeById } from '../utils/showtimeGenerator';
+import { useAuth } from '../context/AuthContext';
+import {
+  saveBookingToFirestore,
+  holdSeatsInFirestore,
+  releaseHeldSeats,
+  checkSeatConflicts,
+} from '../firebase/bookingService';
+import { BookingSteps } from '../components/Booking/BookingSteps';
+import { ShowtimeSelection } from '../components/Booking/ShowtimeSelection';
+import { SeatMap } from '../components/Booking/SeatMap';
+import { ComboSelection } from '../components/Booking/ComboSelection';
+import { PaymentSummary } from '../components/Booking/PaymentSummary';
+import { getSeatLabel, formatCurrency, isShowtimePast } from '../utils';
+
+export const BookingPage: React.FC = () => {
+  const { movieId } = useParams<{ movieId: string }>();
+  const [searchParams] = useSearchParams();
+  const showtimeIdParam = searchParams.get('showtimeId') || searchParams.get('showtime');
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { user, isAuthenticated } = useAuth();
+
+  // Authentication Guard
+  useEffect(() => {
+    if (!isAuthenticated) {
+      navigate('/dang-nhap', { state: { from: location.pathname } });
+    }
+  }, [isAuthenticated, navigate, location]);
+
+  // Find movie
+  const [movie, setMovie] = useState(() => movies.find((m) => m.id === movieId));
+
+  useEffect(() => {
+    if (movieId) {
+      getMovieByIdFromFirestore(movieId).then((m) => {
+        if (m) setMovie(m);
+      });
+    }
+  }, [movieId]);
+
+  // Stepper State (0: Showtime, 1: Seat, 2: Combo, 3: Payment)
+  const [currentStep, setCurrentStep] = useState<number>(0);
+  const [selectedShowtime, setSelectedShowtime] = useState<Showtime | null>(null);
+  const [selectedSeats, setSelectedSeats] = useState<Seat[]>([]);
+  const [selectedCombos, setSelectedCombos] = useState<SelectedCombo[]>([]);
+  const [expiredAlertMessage, setExpiredAlertMessage] = useState<string | null>(null);
+
+  // ——— Seat Hold state (khôi phục từ sessionStorage để tránh mất id khi F5) ———
+  const [currentHoldId, setCurrentHoldId] = useState<string | null>(() => {
+    try {
+      return sessionStorage.getItem('cineviet_current_hold_id');
+    } catch {
+      return null;
+    }
+  });
+  // Countdown giữ ghế (giây). Khởi tạo = 300 (5 phút), sẽ chạy khi holdId có giá trị.
+  const [holdSecondsLeft, setHoldSecondsLeft] = useState<number>(300);
+  const [holdExpired, setHoldExpired] = useState<boolean>(false);
+
+  // Đồng bộ currentHoldId vào sessionStorage
+  useEffect(() => {
+    try {
+      if (currentHoldId) {
+        sessionStorage.setItem('cineviet_current_hold_id', currentHoldId);
+      } else {
+        sessionStorage.removeItem('cineviet_current_hold_id');
+      }
+    } catch {}
+  }, [currentHoldId]);
+
+  // ——— Seat Hold: countdown timer khi holdId tồn tại ———
+  useEffect(() => {
+    if (!currentHoldId) return;
+
+    setHoldSecondsLeft(300);
+    setHoldExpired(false);
+
+    const interval = setInterval(() => {
+      setHoldSecondsLeft((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          setHoldExpired(true);
+          // Giải phóng trên Firestore khi hết giờ
+          if (selectedShowtime) {
+            releaseHeldSeats({
+              holdId: currentHoldId,
+              showtimeId: selectedShowtime.id,
+              userId: user?.uid || 'guest',
+            });
+          }
+          setCurrentHoldId(null);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [currentHoldId, selectedShowtime, user]);
+
+  // ——— Giải phóng hold khi component unmount hoặc rời trang / đóng tab ———
+  useEffect(() => {
+    const handleUnload = () => {
+      const savedHoldId = sessionStorage.getItem('cineviet_current_hold_id');
+      if (selectedShowtime) {
+        releaseHeldSeats({
+          holdId: savedHoldId || currentHoldId,
+          showtimeId: selectedShowtime.id,
+          seatLabels: selectedSeats.map((s) => getSeatLabel(s)),
+          userId: user?.uid || 'guest',
+        });
+      }
+    };
+
+    window.addEventListener('pagehide', handleUnload);
+    return () => {
+      window.removeEventListener('pagehide', handleUnload);
+      if (selectedShowtime) {
+        releaseHeldSeats({
+          holdId: currentHoldId,
+          showtimeId: selectedShowtime.id,
+          seatLabels: selectedSeats.map((s) => getSeatLabel(s)),
+          userId: user?.uid || 'guest',
+        });
+      }
+    };
+  }, [currentHoldId, selectedShowtime, selectedSeats, user]);
+
+  // ——— Helper format MM:SS ———
+  const formatHoldTimer = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  };
+
+  // Auto-select showtime if showtimeId is provided in URL
+  useEffect(() => {
+    if (showtimeIdParam && !selectedShowtime) {
+      const foundSt = findShowtimeById(showtimeIdParam, movieId);
+      if (foundSt) {
+        if (isShowtimePast(foundSt.date, foundSt.startTime)) {
+          setExpiredAlertMessage(
+            `Suất chiếu lúc ${foundSt.startTime} ngày ${foundSt.date} tại ${foundSt.cinemaName} đã qua giờ chiếu. Vui lòng chọn một suất chiếu khác!`
+          );
+          setCurrentStep(0);
+        } else {
+          setSelectedShowtime(foundSt);
+          setCurrentStep(1); // Jump to seat selection
+        }
+      }
+    }
+  }, [showtimeIdParam, selectedShowtime, movieId]);
+
+  // Calculation for sidebar
+  const seatsTotal = useMemo(() => {
+    return selectedSeats.reduce((sum, seat) => sum + seat.price, 0);
+  }, [selectedSeats]);
+
+  const combosTotal = useMemo(() => {
+    return selectedCombos.reduce(
+      (sum, sc) => sum + sc.combo.price * sc.quantity,
+      0
+    );
+  }, [selectedCombos]);
+
+  const totalAmount = seatsTotal + combosTotal;
+
+  // Handlers for steps
+  const handleSelectShowtime = (st: Showtime) => {
+    if (isShowtimePast(st.date, st.startTime)) {
+      setExpiredAlertMessage(`Suất chiếu lúc ${st.startTime} đã qua thời gian bắt đầu. Vui lòng chọn một suất chiếu khác.`);
+      return;
+    }
+    setExpiredAlertMessage(null);
+
+    // Giải phóng hold cũ nếu đổi suất chiếu
+    if (selectedShowtime) {
+      releaseHeldSeats({
+        holdId: currentHoldId,
+        showtimeId: selectedShowtime.id,
+        seatLabels: selectedSeats.map((s) => getSeatLabel(s)),
+        userId: user?.uid || 'guest',
+      });
+      setCurrentHoldId(null);
+    }
+
+    setSelectedShowtime(st);
+    setSelectedSeats([]);
+    setCurrentStep(1);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  // Cập nhật ghế khi người dùng click trên sơ đồ ghế
+  const handleSeatChange = (newSeats: Seat[]) => {
+    // Nếu ghế bị bỏ bớt đi và trước đó đã có hold
+    if (currentHoldId && selectedShowtime && newSeats.length < selectedSeats.length) {
+      const removedSeats = selectedSeats.filter(
+        (oldS) => !newSeats.some((newS) => newS.id === oldS.id)
+      );
+      if (removedSeats.length > 0) {
+        releaseHeldSeats({
+          holdId: currentHoldId,
+          showtimeId: selectedShowtime.id,
+          seatLabels: removedSeats.map((s) => getSeatLabel(s)),
+          userId: user?.uid || 'guest',
+        });
+      }
+      if (newSeats.length === 0) {
+        setCurrentHoldId(null);
+      }
+    }
+    setSelectedSeats(newSeats);
+  };
+
+  const handleNextFromSeats = async () => {
+    if (selectedSeats.length === 0) return;
+    if (selectedShowtime && isShowtimePast(selectedShowtime.date, selectedShowtime.startTime)) {
+      setExpiredAlertMessage(`Suất chiếu đã chọn (${selectedShowtime.startTime}) đã qua giờ chiếu. Vui lòng chọn suất chiếu khác!`);
+      setSelectedShowtime(null);
+      setSelectedSeats([]);
+      setCurrentStep(0);
+      return;
+    }
+
+    // Kiểm tra xung đột: ghế có bị ai khác thanh toán hoặc giữ trước không
+    if (selectedShowtime) {
+      const seatLabels = selectedSeats.map((s) => getSeatLabel(s));
+      const conflicts = await checkSeatConflicts(
+        selectedShowtime,
+        seatLabels,
+        user?.uid || 'guest',
+        currentHoldId,
+        movie?.title
+      );
+
+      if (conflicts.length > 0) {
+        alert(`Ghế ${conflicts.join(', ')} vừa được khách khác giữ hoặc thanh toán trước! Vui lòng chọn ghế khác.`);
+        setSelectedSeats((prev) =>
+          prev.filter((s) => !conflicts.includes(getSeatLabel(s)))
+        );
+        return;
+      }
+    }
+
+    // Giải phóng hold cũ nếu có
+    if (currentHoldId && selectedShowtime) {
+      releaseHeldSeats({
+        holdId: currentHoldId,
+        showtimeId: selectedShowtime.id,
+        userId: user?.uid || 'guest',
+      });
+      setCurrentHoldId(null);
+    }
+
+    // Tạo hold mới cho các ghế đã chọn (5 phút)
+    if (selectedShowtime) {
+      const newHoldId = await holdSeatsInFirestore(
+        selectedShowtime,
+        selectedSeats.map((s) => getSeatLabel(s)),
+        user?.uid || 'guest'
+      );
+      if (newHoldId) setCurrentHoldId(newHoldId);
+    }
+
+    setCurrentStep(2);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleNextFromCombos = () => {
+    if (selectedShowtime && isShowtimePast(selectedShowtime.date, selectedShowtime.startTime)) {
+      setExpiredAlertMessage(`Suất chiếu đã chọn (${selectedShowtime.startTime}) đã qua giờ chiếu. Vui lòng chọn suất chiếu khác!`);
+      setSelectedShowtime(null);
+      setSelectedSeats([]);
+      setCurrentStep(0);
+      return;
+    }
+    setCurrentStep(3);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handlePrevStep = () => {
+    if (currentStep > 0) {
+      // Khi quay lại bước chọn ghế (từ bước combo), giải phóng hold trên Firestore để các tài khoản khác không bị kẹt
+      if (currentStep === 2 && selectedShowtime) {
+        releaseHeldSeats({
+          holdId: currentHoldId,
+          showtimeId: selectedShowtime.id,
+          seatLabels: selectedSeats.map((s) => getSeatLabel(s)),
+          userId: user?.uid || 'guest',
+        });
+        setCurrentHoldId(null);
+      }
+      setCurrentStep((prev) => prev - 1);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  // Hủy giữ ghế / hủy chọn ghế
+  const handleCancelSeatHold = async (askConfirm = true) => {
+    if (askConfirm) {
+      const ok = window.confirm('Bạn có chắc chắn muốn hủy giữ các ghế này và chọn lại không?');
+      if (!ok) return;
+    }
+
+    if (selectedShowtime) {
+      await releaseHeldSeats({
+        holdId: currentHoldId,
+        showtimeId: selectedShowtime.id,
+        seatLabels: selectedSeats.map((s) => getSeatLabel(s)),
+        userId: user?.uid || 'guest',
+      });
+    } else if (currentHoldId) {
+      await releaseHeldSeats(currentHoldId);
+    }
+
+    setCurrentHoldId(null);
+    setSelectedSeats([]);
+    setSelectedCombos([]);
+    setHoldSecondsLeft(300);
+    setHoldExpired(false);
+    setCurrentStep(1); // Quay lại bước chọn ghế
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handlePaymentConfirm = async (paymentData?: {
+    paymentMethod: string;
+    discountCode: string;
+    discountAmount: number;
+    finalTotal: number;
+  }) => {
+    if (selectedShowtime && isShowtimePast(selectedShowtime.date, selectedShowtime.startTime)) {
+      alert('Suất chiếu đã chọn đã qua giờ chiếu. Không thể hoàn tất giao dịch! Vui lòng chọn suất khác.');
+      setSelectedShowtime(null);
+      setSelectedSeats([]);
+      setCurrentStep(0);
+      return;
+    }
+
+    // Chặn trùng vé: kiểm tra ghế lần cuối trước khi ghi nhận thanh toán
+    if (selectedShowtime) {
+      const seatLabels = selectedSeats.map((s) => getSeatLabel(s));
+      const conflicts = await checkSeatConflicts(
+        selectedShowtime,
+        seatLabels,
+        user?.uid || 'guest',
+        currentHoldId,
+        movie?.title
+      );
+
+      if (conflicts.length > 0) {
+        alert(`Rất tiếc! Ghế ${conflicts.join(', ')} vừa có khách khác hoàn tất thanh toán trước bạn. Giao dịch không thể tiếp tục!`);
+        setCurrentStep(1); // Quay lại bước chọn ghế
+        setSelectedSeats((prev) =>
+          prev.filter((s) => !conflicts.includes(getSeatLabel(s)))
+        );
+        return;
+      }
+    }
+
+    const bookingCode = 'BK' + Math.floor(100000 + Math.random() * 900000);
+    const finalAmount = paymentData ? paymentData.finalTotal : totalAmount;
+
+    // Chuẩn bị dữ liệu vé đặt
+    const bookingRecord: Booking = {
+      id: bookingCode,
+      orderId: 'CV-' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '-' + bookingCode.slice(-3),
+      showtimeId: selectedShowtime?.id,
+      movieId: movie?.id,
+      movieTitle: movie?.title || 'Phim Chiếu Rạp',
+      moviePoster: movie?.poster || '',
+      cinemaId: selectedShowtime?.cinemaId,
+      cinemaName: selectedShowtime?.cinemaName || '',
+      roomId: selectedShowtime?.roomId,
+      roomName: selectedShowtime?.roomName || '',
+      date: selectedShowtime?.date || '',
+      startTime: selectedShowtime?.startTime || '',
+      seatLabels: selectedSeats.map((s) => getSeatLabel(s)),
+      seats: selectedSeats,
+      combos: selectedCombos.map((c) => ({
+        name: c.combo.name,
+        quantity: c.quantity,
+        price: c.combo.price,
+      })),
+      totalPrice: finalAmount,
+      status: 'confirmed',
+      paymentMethod: paymentData?.paymentMethod || 'VNPay',
+      createdAt: new Date().toISOString(),
+    };
+
+    // Tự động lưu lên Firestore Database (và lưu dự phòng LocalStorage)
+    saveBookingToFirestore(bookingRecord, user).catch((err) =>
+      console.warn('Lỗi ghi vé lên Firebase:', err)
+    );
+
+    // Giải phóng hold sau khi thanh toán thành công
+    if (currentHoldId) {
+      releaseHeldSeats(currentHoldId);
+      setCurrentHoldId(null);
+    }
+
+    navigate('/ket-qua-thanh-toan', {
+      state: {
+        bookingId: bookingCode,
+        movie,
+        showtime: selectedShowtime,
+        seats: selectedSeats,
+        combos: selectedCombos,
+        totalAmount: finalAmount,
+        paymentMethod: paymentData?.paymentMethod || 'VNPay',
+        discountCode: paymentData?.discountCode || '',
+        discountAmount: paymentData?.discountAmount || 0,
+        createdAt: new Date().toISOString(),
+      },
+    });
+  };
+
+  // Movie Not Found Screen
+  if (!movie) {
+    return (
+      <div className="min-h-screen bg-[#0f0f0f] text-white flex flex-col items-center justify-center p-6 text-center">
+        <div className="w-16 h-16 rounded-full bg-red-950/80 border border-red-800 flex items-center justify-center text-red-500 mb-4">
+          <AlertCircle className="w-8 h-8" />
+        </div>
+        <h1 className="text-2xl font-bold mb-2">Không tìm thấy thông tin phim</h1>
+        <p className="text-gray-400 text-sm max-w-md mb-6">
+          Phim bạn đang tìm kiếm không tồn tại hoặc đã ngừng chiếu. Vui lòng quay lại danh sách phim đang chiếu để chọn phim khác.
+        </p>
+        <Link
+          to="/"
+          className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-red-600 hover:bg-red-700 text-white font-semibold transition"
+        >
+          <Home className="w-4 h-4" />
+          <span>Về Trang Chủ</span>
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#0f0f0f] text-white flex flex-col">
+      {/* Step Indicator Header */}
+      <BookingSteps currentStep={currentStep} />
+
+      {/* Main Content Area */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+          {/* Main Booking Step Flow (8 cols) */}
+          <div className="lg:col-span-8 space-y-6">
+            {/* Expired Showtime Alert */}
+            {expiredAlertMessage && (
+              <div className="bg-red-950/60 border border-red-700/80 rounded-2xl p-4 flex items-start justify-between gap-3 text-red-200 animate-fadeIn">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+                  <div>
+                    <h4 className="font-bold text-sm text-red-300">Không thể chọn suất chiếu này</h4>
+                    <p className="text-xs text-red-200/90 mt-0.5">{expiredAlertMessage}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setExpiredAlertMessage(null)}
+                  className="text-red-400 hover:text-white text-xs font-semibold px-2 py-1 rounded-md hover:bg-red-900/40 transition cursor-pointer"
+                >
+                  Đóng
+                </button>
+              </div>
+            )}
+
+            {/* Hold Expired Alert */}
+            {holdExpired && (
+              <div className="bg-yellow-950/70 border border-yellow-600/80 rounded-2xl p-4 flex items-start gap-3 text-yellow-200 animate-fadeIn">
+                <Clock className="w-5 h-5 text-yellow-400 shrink-0 mt-0.5" />
+                <div>
+                  <h4 className="font-bold text-sm text-yellow-300">⏰ Thời gian giữ ghế đã hết!</h4>
+                  <p className="text-xs text-yellow-200/90 mt-0.5">
+                    Ghế bạn đã chọn không còn được giữ. Vui lòng quay lại chọn ghế để tiếp tục.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => { setHoldExpired(false); setCurrentStep(1); window.scrollTo({ top: 0, behavior: 'smooth' }); }}
+                    className="mt-2 text-xs font-semibold text-yellow-400 hover:text-yellow-200 underline cursor-pointer"
+                  >
+                    Quay lại chọn ghế →
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Hold Countdown Banner (khi đang ở bước 2 hoặc 3 và đang có hold) */}
+            {currentHoldId && (currentStep === 2 || currentStep === 3) && !holdExpired && (
+              <div className={`flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 rounded-xl border text-sm font-semibold ${
+                holdSecondsLeft < 60
+                  ? 'bg-red-950/80 border-red-600 text-red-300 animate-pulse'
+                  : 'bg-yellow-950/60 border-yellow-600/60 text-yellow-300'
+              }`}>
+                <div className="flex items-center gap-2">
+                  <Clock className="w-4 h-4 shrink-0" />
+                  <span>Ghế được giữ cho bạn trong:</span>
+                  <span className="font-mono text-base font-black text-white">
+                    {formatHoldTimer(holdSecondsLeft)}
+                  </span>
+                  <span className="text-xs opacity-70 font-normal hidden sm:inline">· Vui lòng hoàn tất thanh toán</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleCancelSeatHold(true)}
+                  className="px-3 py-1.5 rounded-lg bg-red-900/80 hover:bg-red-800 text-red-100 hover:text-white border border-red-600/60 text-xs font-bold flex items-center gap-1.5 transition active:scale-95 cursor-pointer shadow-sm ml-auto"
+                  title="Hủy phiên giữ ghế này và chọn lại ghế khác"
+                >
+                  <XCircle className="w-3.5 h-3.5" />
+                  <span>Hủy giữ ghế</span>
+                </button>
+              </div>
+            )}
+
+            {/* Step 0: Showtime Selection */}
+            {currentStep === 0 && (
+              <ShowtimeSelection
+                movieId={movie.id}
+                onSelect={handleSelectShowtime}
+                selectedShowtime={selectedShowtime}
+              />
+            )}
+
+            {/* Step 1: Seat Map Selection */}
+            {currentStep === 1 && selectedShowtime && (
+              <div className="space-y-6 animate-fadeIn">
+                <SeatMap
+                  showtime={selectedShowtime}
+                  selectedSeats={selectedSeats}
+                  onSeatChange={handleSeatChange}
+                  maxSeats={8}
+                  movieTitle={movie?.title}
+                  currentHoldId={currentHoldId}
+                  onCancelHold={() => handleCancelSeatHold(false)}
+                  userId={user?.uid || 'guest'}
+                />
+
+                {/* Step Action Buttons */}
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-gray-800">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handlePrevStep}
+                      className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl border border-gray-700 hover:bg-gray-800 text-gray-300 font-semibold text-sm transition cursor-pointer"
+                    >
+                      <ArrowLeft className="w-4 h-4" />
+                      <span>Đổi suất chiếu</span>
+                    </button>
+
+                    {selectedSeats.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => handleCancelSeatHold(false)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-red-800/70 bg-red-950/50 hover:bg-red-900 text-red-300 hover:text-white font-semibold text-sm transition cursor-pointer"
+                        title="Hủy đặt các ghế đã chọn"
+                      >
+                        <XCircle className="w-4 h-4" />
+                        <span>Hủy đặt ghế</span>
+                      </button>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    disabled={selectedSeats.length === 0}
+                    onClick={handleNextFromSeats}
+                    className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 disabled:bg-gray-800 disabled:text-gray-500 text-white font-bold text-sm shadow-lg shadow-red-600/30 transition active:scale-95 cursor-pointer disabled:cursor-not-allowed ml-auto"
+                  >
+                    <span>Tiếp tục chọn bắp nước</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Step 2: Combo Food Selection */}
+            {currentStep === 2 && (
+              <div className="space-y-6 animate-fadeIn">
+                <ComboSelection
+                  selectedCombos={selectedCombos}
+                  onComboChange={setSelectedCombos}
+                  onSkip={handleNextFromCombos}
+                />
+
+                {/* Step Action Buttons */}
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-gray-800">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handlePrevStep}
+                      className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl border border-gray-700 hover:bg-gray-800 text-gray-300 font-semibold text-sm transition cursor-pointer"
+                    >
+                      <ArrowLeft className="w-4 h-4" />
+                      <span>Quay lại chọn ghế</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleCancelSeatHold(true)}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-red-800/70 bg-red-950/50 hover:bg-red-900 text-red-300 hover:text-white font-semibold text-sm transition cursor-pointer"
+                      title="Hủy đặt và giải phóng ghế"
+                    >
+                      <XCircle className="w-4 h-4" />
+                      <span>Hủy giữ ghế</span>
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleNextFromCombos}
+                    className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-sm shadow-lg shadow-red-600/30 transition active:scale-95 cursor-pointer ml-auto"
+                  >
+                    <span>Tiếp tục thanh toán</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Step 3: Payment Summary */}
+            {currentStep === 3 && selectedShowtime && (
+              <PaymentSummary
+                movie={movie}
+                showtime={selectedShowtime}
+                selectedSeats={selectedSeats}
+                selectedCombos={selectedCombos}
+                onConfirm={handlePaymentConfirm}
+                onBack={handlePrevStep}
+                holdSecondsLeft={holdSecondsLeft}
+                isHoldExpired={holdExpired}
+                onCancelHold={() => handleCancelSeatHold(true)}
+              />
+            )}
+          </div>
+
+          {/* Desktop Sticky Order Summary Sidebar (4 cols) */}
+          <aside className="lg:col-span-4 hidden lg:block sticky top-6">
+            <div className="bg-gray-900 border border-gray-800 rounded-2xl p-6 shadow-xl space-y-5">
+              <h3 className="text-base font-bold text-white border-b border-gray-800 pb-3 flex items-center gap-2">
+                <Film className="w-4 h-4 text-red-500" />
+                Thông Tin Vé Đặt
+              </h3>
+
+              {/* Movie info snippet */}
+              <div className="flex gap-3">
+                <img
+                  src={movie.poster}
+                  alt={movie.title}
+                  className="w-16 h-24 object-cover rounded-lg border border-gray-800 shadow shrink-0"
+                />
+                <div className="flex-1 min-w-0">
+                  <span className="inline-block bg-red-600 text-white text-[10px] font-bold px-1.5 py-0.5 rounded mb-1">
+                    {movie.ageRating || 'T16'}
+                  </span>
+                  <h4 className="font-bold text-sm text-white truncate">
+                    {movie.title}
+                  </h4>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    {movie.duration} phút • {movie.language}
+                  </p>
+                </div>
+              </div>
+
+              {/* Showtime info */}
+              {selectedShowtime ? (
+                <div className="bg-gray-800/60 rounded-xl p-3 border border-gray-700/50 space-y-2 text-xs">
+                  <div className="flex items-center gap-2 text-gray-200">
+                    <MapPin className="w-3.5 h-3.5 text-red-500 shrink-0" />
+                    <span className="font-semibold truncate">{selectedShowtime.cinemaName}</span>
+                  </div>
+                  <div className="flex items-center justify-between text-gray-300">
+                    <div className="flex items-center gap-1.5">
+                      <Calendar className="w-3.5 h-3.5 text-red-500" />
+                      <span>{selectedShowtime.date}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-red-500" />
+                      <span className="font-bold text-white">{selectedShowtime.startTime}</span>
+                    </div>
+                  </div>
+                  <div className="text-gray-400 text-[11px] border-t border-gray-700/50 pt-1.5 flex justify-between">
+                    <span>Phòng: {selectedShowtime.roomName}</span>
+                    <span className="text-yellow-400 font-semibold">{selectedShowtime.roomType}</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-gray-800/40 rounded-xl p-3 border border-dashed border-gray-700 text-xs text-gray-500 italic text-center">
+                  Chưa chọn suất chiếu
+                </div>
+              )}
+
+              {/* Seat Hold Countdown Sidebar Badge */}
+              {currentHoldId && !holdExpired && (currentStep === 2 || currentStep === 3) && (
+                <div className={`flex flex-col gap-2 p-3 rounded-xl border text-xs font-semibold ${
+                  holdSecondsLeft < 60
+                    ? 'bg-red-950/80 border-red-600 text-red-300 animate-pulse'
+                    : 'bg-yellow-950/60 border-yellow-600/50 text-yellow-300'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <Clock className="w-3.5 h-3.5 shrink-0" />
+                    <span>Giữ ghế còn:</span>
+                    <span className="font-mono font-black text-white ml-auto">{formatHoldTimer(holdSecondsLeft)}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleCancelSeatHold(true)}
+                    className="w-full py-1.5 px-2 rounded-lg bg-red-900/60 hover:bg-red-800 border border-red-700/60 text-red-200 hover:text-white text-[11px] font-bold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
+                  >
+                    <XCircle className="w-3.5 h-3.5" />
+                    <span>Hủy giữ ghế</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Selected Seats summary */}
+              {selectedSeats.length > 0 && (
+                <div className="space-y-1.5 border-t border-gray-800 pt-3">
+                  <div className="flex justify-between text-xs text-gray-400">
+                    <span className="flex items-center gap-1">
+                      <Armchair className="w-3.5 h-3.5 text-red-500" />
+                      Ghế đã chọn ({selectedSeats.length}):
+                    </span>
+                    <span className="text-white font-medium">
+                      {formatCurrency(seatsTotal)}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {selectedSeats.map((s) => (
+                      <span
+                        key={s.id}
+                        className="bg-gray-800 text-gray-200 text-[11px] font-bold px-2 py-0.5 rounded border border-gray-700"
+                      >
+                        {getSeatLabel(s)}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Selected Combos summary */}
+              {selectedCombos.length > 0 && (
+                <div className="space-y-1.5 border-t border-gray-800 pt-3">
+                  <div className="flex justify-between text-xs text-gray-400">
+                    <span className="flex items-center gap-1">
+                      <ShoppingBag className="w-3.5 h-3.5 text-red-500" />
+                      Bắp nước ({selectedCombos.reduce((a, b) => a + b.quantity, 0)} món):
+                    </span>
+                    <span className="text-white font-medium">
+                      {formatCurrency(combosTotal)}
+                    </span>
+                  </div>
+                  <div className="space-y-1">
+                    {selectedCombos.map(({ combo, quantity }) => (
+                      <div
+                        key={combo.id}
+                        className="flex justify-between text-[11px] text-gray-300"
+                      >
+                        <span className="truncate max-w-[170px]">
+                          {quantity}x {combo.name}
+                        </span>
+                        <span>{formatCurrency(combo.price * quantity)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Grand Total */}
+              <div className="border-t border-gray-800 pt-4 flex items-baseline justify-between">
+                <span className="text-sm font-semibold text-gray-400">Tổng tạm tính:</span>
+                <span className="text-2xl font-black text-red-500">
+                  {formatCurrency(totalAmount)}
+                </span>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default BookingPage;
